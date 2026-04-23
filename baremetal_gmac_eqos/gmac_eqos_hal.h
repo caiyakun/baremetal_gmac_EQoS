@@ -36,12 +36,14 @@ typedef enum {
 	GMAC_DUPLEX_FULL,
 } gmac_duplex_t;
 
-typedef struct {
+typedef struct gmac_hal_context {
 	uintptr_t csr_base; /* EQoS CSR 统一基址（含 MAC/MTL/DMA） */
 	uint8_t mac_addr[6];
 	/* 内部状态，勿直接修改 */
 	uint32_t _priv[64];
 } gmac_hal_context_t;
+
+#include "gmac_eqos_phy.h"
 
 #define ETH_HEADER_LEN		14U
 #define GMAC_CRC_LENGTH		4U
@@ -68,10 +70,6 @@ extern void gmac_io_write32(uintptr_t addr, uint32_t v);
 
 /* 可选：CSR 时钟 Hz，用于 1us tick；未知时可传 0 则跳过写 1US 计数器 */
 void gmac_eqos_set_csr_clock_hz(unsigned hz);
-
-void gmac_glb_cfg_init(gmac_hal_context_t *hal);
-void gmac_phy_vcs8541_init(void *phy_cfg, gmac_hal_context_t *hal, void *phy_extra);
-void gmac_phy_802_3_basic_phy_deinit(void *phy_cfg, gmac_hal_context_t *hal);
 
 void gmac_mac_init(gmac_hal_context_t *hal);
 void gmac_mac_near_loopback_prepare(gmac_hal_context_t *hal);

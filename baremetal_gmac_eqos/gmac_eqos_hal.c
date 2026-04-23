@@ -151,24 +151,6 @@ static void mac_set_addr0(gmac_hal_context_t *h, const uint8_t *mac)
 	memcpy(h->mac_addr, mac, 6);
 }
 
-void gmac_glb_cfg_init(gmac_hal_context_t *hal)
-{
-	(void)hal;
-}
-
-void gmac_phy_vcs8541_init(void *phy_cfg, gmac_hal_context_t *hal, void *phy_extra)
-{
-	(void)phy_cfg;
-	(void)hal;
-	(void)phy_extra;
-}
-
-void gmac_phy_802_3_basic_phy_deinit(void *phy_cfg, gmac_hal_context_t *hal)
-{
-	(void)phy_cfg;
-	(void)hal;
-}
-
 void gmac_mac_init(gmac_hal_context_t *hal)
 {
 	uint32_t v;
@@ -516,8 +498,17 @@ void test_mac_near_end_loopback_force_link(gmac_speed_t force_link_speed)
 			f->data[i] = (uint8_t)(i & 0xff);
 	}
 
-	gmac_glb_cfg_init(&ctx);
-	gmac_phy_vcs8541_init(NULL, &ctx, NULL);
+	{
+		phy_extra_config_t phy_extra = {
+			.force_link_speed = force_link_speed,
+			.force_duplex = GMAC_DUPLEX_FULL,
+			.phy_loopback_en = false,
+			.is_phy_near_end_loopback = false,
+		};
+
+		gmac_glb_cfg_init(&ctx);
+		gmac_phy_vcs8541_init(&g_eqos_phy_config, &ctx, &phy_extra);
+	}
 	gmac_mac_init(&ctx);
 	gmac_mac_near_loopback_prepare(&ctx);
 	gmac_mac_set_speed(&ctx, force_link_speed);
@@ -549,6 +540,6 @@ void test_mac_near_end_loopback_force_link(gmac_speed_t force_link_speed)
 	}
 
 	gmac_mac_stop(&ctx);
-	gmac_phy_802_3_basic_phy_deinit(NULL, &ctx);
+	gmac_phy_802_3_basic_phy_deinit(&g_eqos_phy_config, &ctx);
 	gmac_mac_del();
 }
