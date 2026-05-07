@@ -1,6 +1,10 @@
 /*
  * Synopsys EQoS 5.40a (DWMAC4) 裸机 HAL — MAC Near-end loopback 与参考 test_gmac.c 流程对齐。
- * 将本目录加入 include path，并在板级提供 gmac_io_read32 / gmac_io_write32。
+ *
+ * 使用方式：将本目录加入 include path；板级实现 gmac_io_read32 / gmac_io_write32。
+ * 调试输出：实现文件内使用 GMAC_PRINTF（默认 printf）。可在包含本头文件之前定义
+ *   #define GMAC_PRINTF(...)  uart_printf(__VA_ARGS__)
+ * 将日志重定向到 UART；若需完全静默，可定义为 ((void)0)。
  */
 #ifndef GMAC_EQOS_HAL_H
 #define GMAC_EQOS_HAL_H

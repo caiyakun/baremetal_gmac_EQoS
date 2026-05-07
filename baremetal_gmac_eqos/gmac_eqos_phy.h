@@ -1,6 +1,12 @@
 /*
  * VSC8541 + IEEE802.3 Clause 22 PHY 配置（逻辑对齐 P5 test_gmac.c / esp_eth_phy_vcs8541.c）
- * 在包含本头文件之前，须已由 gmac_eqos_hal.h 定义 gmac_hal_context_t、gmac_speed_t、gmac_duplex_t。
+ *
+ * 包含关系：须通过 gmac_eqos_hal.h 间接包含（该头在定义 gmac_hal_context_t 后 include 本文件），
+ * 以便使用 gmac_speed_t、gmac_duplex_t 与 gmac_hal_context_t。
+ *
+ * phy_config_t：MDIO 地址、复位超时、GPIO 复位脚（负数表示不用 GPIO）等。
+ * phy_extra_config_t：可选「强制链路」参数，传给 gmac_phy_vcs8541_init；为 NULL 时不改 BMCR 速率/双工。
+ * 日志与 gmac_eqos_hal 相同，由 GMAC_PRINTF 输出（见 gmac_eqos_hal.h 说明）。
  */
 #ifndef GMAC_EQOS_PHY_H
 #define GMAC_EQOS_PHY_H
@@ -55,20 +61,20 @@
 #endif
 
 typedef struct {
-	int addr;
-	unsigned reset_timeout_ms;
-	unsigned autonego_timeout_ms;
-	int link_status;
-	int reset_gpio_num;
+	int addr;			/* MDIO PHY 地址 0~31，或 GMAC_PHY_ADDR_AUTO 自动扫描 */
+	unsigned reset_timeout_ms;	/* BMCR 软复位等轮询上限 */
+	unsigned autonego_timeout_ms;	/* 预留：自协商超时 */
+	int link_status;		/* GMAC_LINK_UP / GMAC_LINK_DOWN，由上层或链路检测更新 */
+	int reset_gpio_num;		/* PHY nRST GPIO 编号，<0 表示不使用 GPIO 硬件复位 */
 	unsigned hw_reset_assert_time_us;
 	unsigned post_hw_reset_delay_ms;
 } phy_config_t;
 
 typedef struct {
-	gmac_speed_t force_link_speed;
+	gmac_speed_t force_link_speed;	/* 与 MAC 侧 gmac_mac_set_speed 应对齐 */
 	gmac_duplex_t force_duplex;
-	bool phy_loopback_en;
-	bool is_phy_near_end_loopback;
+	bool phy_loopback_en;		/* true 时根据 is_phy_near_end_loopback 选近端/远端 PHY 环回 */
+	bool is_phy_near_end_loopback;	/* true：BMCR loopback；false：EPC 远端环回位 */
 } phy_extra_config_t;
 
 extern phy_config_t g_eqos_phy_config;

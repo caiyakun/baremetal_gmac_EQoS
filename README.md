@@ -26,6 +26,49 @@
   - **MAC / DMA / 描述符**：`dwmac4_core.c`、`dwmac4_dma.c`、`dwmac4_lib.c`、`dwmac4_descs.c`、`dwmac4.h`、`dwmac4_dma.h` 等。
   - **设备树 compatible**：`stmmac_platform.c` 中 `stmmac_gmac4_compats[]` 已包含 **`snps,dwmac-5.40a`**。
 
+### 2.1.1 `snps,dwmac-5.40a` 在 Linux stmmac 中的源码位置
+
+完整路径：
+
+`/satassd/01_FW/33-embed_linux/cai_test/linux/drivers/net/ethernet/stmicro/stmmac/stmmac_platform.c`
+
+关键代码 1：`stmmac_gmac4_compats[]` 里已经列出 `snps,dwmac-5.40a`，说明 Linux stmmac 将 5.40a 按 **GMAC4 / DWMAC4 系列**处理。
+
+```c
+/* Compatible string array for all gmac4 devices */
+static const char * const stmmac_gmac4_compats[] = {
+	"snps,dwmac-4.00",
+	"snps,dwmac-4.10a",
+	"snps,dwmac-4.20a",
+	"snps,dwmac-5.00a",
+	"snps,dwmac-5.10a",
+	"snps,dwmac-5.20",
+	"snps,dwmac-5.30a",
+	"snps,dwmac-5.40a",
+	NULL
+};
+```
+
+关键代码 2：平台解析设备树时，如果 compatible 匹配该数组，就把 core type 设置为 `DWMAC_CORE_GMAC4`，后续会走 `dwmac4_*` 系列 MAC/DMA/descriptor 实现。
+
+```c
+if (of_device_compatible_match(np, stmmac_gmac4_compats)) {
+	plat->core_type = DWMAC_CORE_GMAC4;
+	plat->pmt = true;
+	if (of_property_read_bool(np, "snps,tso"))
+		plat->flags |= STMMAC_FLAG_TSO_EN;
+}
+```
+
+因此本仓库裸机实现选择参考这些 Linux 文件：
+
+- `linux/drivers/net/ethernet/stmicro/stmmac/dwmac4_core.c`：MAC 配置、`GMAC_CONFIG`、MAC loopback 等。
+- `linux/drivers/net/ethernet/stmicro/stmmac/dwmac4_dma.c`：DMA channel、PBL、ring base/tail、启动停止等。
+- `linux/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c`：DWMAC4 normal descriptor 格式与 TX/RX descriptor 读写。
+- `linux/drivers/net/ethernet/stmicro/stmmac/dwmac4.h`：GMAC/MTL 寄存器 offset 与 bit。
+- `linux/drivers/net/ethernet/stmicro/stmmac/dwmac4_dma.h`：DMA common/channel 寄存器 offset 与 bit。
+- `linux/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c`：GMAC4 MDIO `GMAC_MDIO_ADDR` / `GMAC_MDIO_DATA` 的读写格式。
+
 ### 2.2 与 5.40a 的适用性（摘要）
 
 - **适用**：寄存器布局、DMA 单通道典型流程、MAC `LM` 环回、RGMII 相关 `GMAC_PHYIF_CONTROL_STATUS` 等与 **DWMAC4 / EQoS 同谱系** 的代码，均可作为裸机编程的主要参考。
