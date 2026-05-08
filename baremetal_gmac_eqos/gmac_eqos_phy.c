@@ -10,8 +10,8 @@
  *   - bit3:2 GOC:读=3<<2,写=1<<2(GMAC4 模式,区别于旧 DWC 的 separate CR 寄存器)。
  *   - bit25:21 PA:PHY 地址 0~31；bit20:16 RDA:Clause 22 寄存器号 0~31。
  *   - 写流程:先写 DATA 低 16 位,再写 ADDR(含 BUSY|GOC|PA|RDA)；读流程:写 ADDR 后读 DATA。
- *   - CSR[11:8](EQOS_MDIO_CLK_CSR_SHIFT):MDC 相对 CSR 时钟分频,缺省 5,可按 SoC 要求用
- *     eqos_mdio_csr_apply() 或编译选项覆盖。
+ *   - CSR[11:8](EQOS_MDIO_CLK_CSR_SHIFT):MDC 相对 CSR 时钟分频；运行时会按 CSR 时钟
+ *     自动选择，使 MDC 尽量不超过 IEEE 802.3 常用的 2.5MHz 上限。
  *
  * 调试:所有用户可见日志经 GMAC_PRINTF(可在包含本模块前 #define GMAC_PRINTF 重定向到串口)。
  */
@@ -33,6 +33,8 @@
 	} while (0)
 
 #define EQOS_BIT(n)		(1U << (n))
+
+// PHY Clause 22 register addresses
 #define ETH_PHY_BMCR_REG_ADDR	0x00U
 #define ETH_PHY_BMSR_REG_ADDR	0x01U
 #define ETH_PHY_IDR1_REG_ADDR	0x02U
@@ -44,19 +46,34 @@
 #define DACS_PHY_DACS_REG_ADDR	0x1CU
 #define GMAC_PHY_RCR_REG_ADDR	0x14U
 #define GMAC_PHY_GC2R_REG_ADDR	0x0EU
+#define VSC8541_LED_MODE_REG_ADDR 0x1DU
 
 #define MII_ADDR_BUSY		1U
 #define MII_GMAC4_GOC_SHIFT	2U
 #define MII_GMAC4_READ		(3U << MII_GMAC4_GOC_SHIFT)
 #define MII_GMAC4_WRITE		(1U << MII_GMAC4_GOC_SHIFT)
 #define MII_DATA_MASK		0xffffU
+#define BMSR_LINK_STATUS	(1U << 2)
+#define BMSR_AN_COMPLETE	(1U << 5)
+#define VSC8541_DACS_SPEED_MASK	(3U << 3)
+#define VSC8541_DACS_DUPLEX	(1U << 5)
 
 #ifndef EQOS_MDIO_CLK_CSR_SHIFT
 #define EQOS_MDIO_CLK_CSR_SHIFT	8U
 #endif
 #ifndef EQOS_MDIO_CLK_CSR_DEFAULT
-#define EQOS_MDIO_CLK_CSR_DEFAULT 5U
+#define EQOS_MDIO_CLK_CSR_DEFAULT 3U     /* MDC = clk_csr_i / 26 */
 #endif
+
+/* 与 Linux include/linux/stmmac.h 的 STMMAC_CSR_xxxM 定义保持一致。 */
+#define EQOS_MDIO_CSR_60_100M	0U /* MDC = clk_csr_i / 42 */
+#define EQOS_MDIO_CSR_100_150M	1U /* MDC = clk_csr_i / 62 */
+#define EQOS_MDIO_CSR_20_35M	2U /* MDC = clk_csr_i / 16 */
+#define EQOS_MDIO_CSR_35_60M	3U /* MDC = clk_csr_i / 26 */
+#define EQOS_MDIO_CSR_150_250M	4U /* MDC = clk_csr_i / 102 */
+#define EQOS_MDIO_CSR_250_300M	5U /* MDC = clk_csr_i / 124 */
+#define EQOS_MDIO_CSR_300_500M	6U /* MDC = clk_csr_i / 204 */
+#define EQOS_MDIO_CSR_500_800M	7U /* MDC = clk_csr_i / 324 */
 
 /*
  * 以下为 VSC8541 扩展寄存器在「位域视图」下的联合体,便于与手册位名对应；
@@ -138,6 +155,21 @@ static struct {
 	uint32_t emacx_tx_clk_delay;
 	uint32_t emacx_rx_clk_delay;
 } s_rgmii_delay = { 0x05U, 0x05U };
+static bool s_rgmii_tx_clk_reverse;
+static bool s_rgmii_rx_clk_reverse;
+
+void gmac_phy_set_rgmii_timing(uint32_t tx_delay, uint32_t rx_delay,
+			       bool tx_clk_reverse, bool rx_clk_reverse)
+{
+	s_rgmii_delay.emacx_tx_clk_delay = tx_delay & 0x7U;
+	s_rgmii_delay.emacx_rx_clk_delay = rx_delay & 0x7U;
+	s_rgmii_tx_clk_reverse = tx_clk_reverse;
+	s_rgmii_rx_clk_reverse = rx_clk_reverse;
+	GMAC_PRINTF("EQoS PHY: set RGMII timing tx_delay=%u rx_delay=%u tx_rev=%u rx_rev=%u\n",
+		    (unsigned)s_rgmii_delay.emacx_tx_clk_delay,
+		    (unsigned)s_rgmii_delay.emacx_rx_clk_delay,
+		    (unsigned)s_rgmii_tx_clk_reverse, (unsigned)s_rgmii_rx_clk_reverse);
+}
 
 /*
  * 板级 weak 钩子(建议在真实 BSP 中提供强符号):
@@ -206,6 +238,59 @@ static void eqos_mdio_csr_apply(gmac_hal_context_t *h, unsigned csr_field)
 		    (unsigned)(csr_field & 0xfU));
 }
 
+static unsigned eqos_mdio_csr_from_clock(unsigned csr_hz)
+{
+	unsigned field = EQOS_MDIO_CLK_CSR_DEFAULT;
+	unsigned div = 124U;
+
+	/*
+	 * DWMAC4/GMAC4 的 GMAC_MDIO_ADDR.CSR[11:8] 不是任意除数，
+	 * 而是硬件预定义的 CSR 时钟范围选择。这里按 Linux stmmac_mdio.c
+	 * 的标准映射选择，目标是让 MDC 维持在 PHY 可接受范围内，通常不超过 2.5MHz。
+	 */
+	if (csr_hz == 0U) {
+		GMAC_PRINTF("EQoS MDIO: CSR 时钟未知,沿用默认分频域 %u\n", field);
+		return field;
+	}
+
+	if (csr_hz < 20000000U) {
+		field = EQOS_MDIO_CSR_20_35M;
+		div = 16U;
+		GMAC_PRINTF("EQoS MDIO: CSR 时钟 %u Hz 低于 20MHz,使用最小范围分频\n", csr_hz);
+	} else if (csr_hz < 35000000U) {
+		field = EQOS_MDIO_CSR_20_35M;
+		div = 16U;
+	} else if (csr_hz < 60000000U) {
+		field = EQOS_MDIO_CSR_35_60M;
+		div = 26U;
+	} else if (csr_hz < 100000000U) {
+		field = EQOS_MDIO_CSR_60_100M;
+		div = 42U;
+	} else if (csr_hz < 150000000U) {
+		field = EQOS_MDIO_CSR_100_150M;
+		div = 62U;
+	} else if (csr_hz < 250000000U) {
+		field = EQOS_MDIO_CSR_150_250M;
+		div = 102U;
+	} else if (csr_hz < 300000000U) {
+		field = EQOS_MDIO_CSR_250_300M;
+		div = 124U;
+	} else if (csr_hz < 500000000U) {
+		field = EQOS_MDIO_CSR_300_500M;
+		div = 204U;
+	} else {
+		field = EQOS_MDIO_CSR_500_800M;
+		div = 324U;
+		if (csr_hz >= 800000000U)
+			GMAC_PRINTF("EQoS MDIO: CSR 时钟 %u Hz 超过 800MHz,已使用最大分频档位\n",
+				    csr_hz);
+	}
+
+	GMAC_PRINTF("EQoS MDIO: csr_clock=%u Hz -> CSR field=%u, divider=/%u, MDC约%u Hz\n",
+		    csr_hz, field, div, csr_hz / div);
+	return field;
+}
+
 static uint32_t mdio_fmt_addr(unsigned pa, unsigned reg)
 {
 	return (((pa & 0x1fU) << 21) | ((reg & 0x1fU) << 16) | MII_ADDR_BUSY);
@@ -267,8 +352,8 @@ static int phy_set_reg_bits(gmac_hal_context_t *hal, uint32_t phy_addr, uint32_t
 	return gmac_write_phy_reg(hal, phy_addr, reg_addr, v);
 }
 
-/* 通过读 Clause22 reg2(IDR1)判断该 MDIO 地址是否有器件响应 */
-static int phy_detect_addr(gmac_hal_context_t *hal, int *detected)
+/* 通过读 Clause22 reg2(IDR1)判断该 MDIO 地址是否有器件响应，组织方式对齐 P5 gmac_phy_detect_phy_addr()。 */
+int gmac_phy_detect_phy_addr(gmac_hal_context_t *hal, int *detected_addr)
 {
 	int a;
 	uint32_t v;
@@ -277,7 +362,7 @@ static int phy_detect_addr(gmac_hal_context_t *hal, int *detected)
 		if (gmac_read_phy_reg(hal, (uint32_t)a, ETH_PHY_IDR1_REG_ADDR, &v))
 			continue;
 		if (v != 0xffffU && v != 0U) {
-			*detected = a;
+			*detected_addr = a;
 			GMAC_PRINTF("EQoS PHY: found PHY at MDIO addr %d (IDR1=0x%lx)\n", a,
 				    (unsigned long)v);
 			return 0;
@@ -292,6 +377,94 @@ static int phy_page_select(phy_config_t *pc, gmac_hal_context_t *hal, uint32_t p
 	gmc_pcr_reg_t pcr = { .register_page_select = page & 0xffffU };
 
 	return gmac_write_phy_reg(hal, (uint32_t)pc->addr, GMAC_PHY_PCR_REG_ADDR, pcr.val);
+}
+
+int gmac_phy_vcs8541_reg_read_write(phy_config_t *phy_cfg, gmac_hal_context_t *hal)
+{
+	uint32_t addr;
+	uint32_t reg_val = 0;
+	uint32_t reg2_phy_id_1 = 0;
+	uint32_t reg3_phy_id_2 = 0;
+	uint32_t reg29_ledmode_sel = 0;
+	uint32_t page_old = 0;
+	uint32_t page_rb = 0;
+
+	if (!phy_cfg)
+		phy_cfg = &g_eqos_phy_config;
+
+	/* 对齐 P5：如果地址是 AUTO，先在 MDIO 0~31 上探测 PHY 地址。 */
+	if (phy_cfg->addr == GMAC_PHY_ADDR_AUTO) {
+		if (gmac_phy_detect_phy_addr(hal, &phy_cfg->addr))
+			return -1;
+	}
+	addr = (uint32_t)phy_cfg->addr;
+
+	GMAC_PRINTF(" ***phy addr = %lu\n", (unsigned long)addr);
+	for (uint32_t i = 0; i < 32U; i++) {
+		if (gmac_read_phy_reg(hal, addr, i, &reg_val)) {
+			GMAC_PRINTF("EQoS PHY: read phy reg addr:%lu failed\n", (unsigned long)i);
+			return -1;
+		}
+		GMAC_PRINTF("phy reg addr:%lu = 0x%lx\n", (unsigned long)i, (unsigned long)reg_val);
+
+		if (i == ETH_PHY_IDR1_REG_ADDR)
+			reg2_phy_id_1 = reg_val;
+		if (i == ETH_PHY_IDR2_REG_ADDR)
+			reg3_phy_id_2 = reg_val;
+		if (i == VSC8541_LED_MODE_REG_ADDR)
+			reg29_ledmode_sel = reg_val;
+	}
+
+	// 不同版本的VSC8541 默认的ledmode不同，所以当发现特定版本的VSC8541时，可以检查ledmode是否正确
+	if ((reg3_phy_id_2 & 0xfU) == 0x01U) {
+		GMAC_PRINTF("# is VSC8541-01: Device Rev is B \n");
+		if ((reg29_ledmode_sel & 0xfU) == 0x01U &&
+		    (((reg29_ledmode_sel & 0xf0U) >> 4) & 0xfU) == 0x01U)   //这是VSC8541-01 默认的ledmode
+			GMAC_PRINTF("VSC8541-01: led0:mode1; led1:mode2\n");
+		else
+			GMAC_PRINTF("EQoS PHY: FAIL — VSC8541-01 LED mode unexpected, reg29=0x%04lx\n",
+				    (unsigned long)reg29_ledmode_sel);
+	} else if ((reg3_phy_id_2 & 0xfU) == 0x02U) {
+		GMAC_PRINTF("# is VSC8541-02&05: Device Rev is C \n"); 
+		if ((reg29_ledmode_sel & 0xfU) == 0x04U &&
+		    (((reg29_ledmode_sel & 0xf0U) >> 4) & 0xfU) == 0x05U) //这是VSC8541-02&05 默认的ledmode
+			GMAC_PRINTF("VSC8541-02&05: led0:mode4; led1:mode5\n");
+		else
+			GMAC_PRINTF("EQoS PHY: FAIL — VSC8541-02&05 LED mode unexpected, reg29=0x%04lx\n",
+				    (unsigned long)reg29_ledmode_sel);
+	} else {
+		GMAC_PRINTF(" !!! Warning: UNKONW PHY..... !!!! \n");
+	}
+
+	if (reg2_phy_id_1 != 0x07U) {
+		GMAC_PRINTF("EQoS PHY: FAIL — reg2 PHY ID1 expected 0x0007, got 0x%04lx\n",
+			    (unsigned long)reg2_phy_id_1);
+		return -1;
+	}
+	GMAC_PRINTF("EQoS PHY: PASS — reg2 PHY ID1 == 0x0007\n");
+
+	/*
+	 * P5 该 helper 主要做寄存器读与 ID/LED 断言；裸机版额外保留一个安全写回测试，
+	 * 用 page select(reg31) 写 0 再读回，最后恢复旧页，验证 MDIO 写路径。
+	 */
+	if (!gmac_read_phy_reg(hal, addr, GMAC_PHY_PCR_REG_ADDR, &page_old)) {
+		GMAC_PRINTF("EQoS PHY: page_old=0x%04lx, write page 0 then readback\n",
+			    (unsigned long)page_old);
+		if (!gmac_write_phy_reg(hal, addr, GMAC_PHY_PCR_REG_ADDR, 0U) &&
+		    !gmac_read_phy_reg(hal, addr, GMAC_PHY_PCR_REG_ADDR, &page_rb) &&
+		    (page_rb & 0xffffU) == 0U) {
+			GMAC_PRINTF("EQoS PHY: PASS — PHY reg31 write/readback OK\n");
+		} else {
+			GMAC_PRINTF("EQoS PHY: FAIL — PHY reg31 write/readback failed, rb=0x%04lx\n",
+				    (unsigned long)page_rb);
+			(void)gmac_write_phy_reg(hal, addr, GMAC_PHY_PCR_REG_ADDR, page_old);
+			return -1;
+		}
+		(void)gmac_write_phy_reg(hal, addr, GMAC_PHY_PCR_REG_ADDR, page_old);
+		GMAC_PRINTF("EQoS PHY: restore page reg31=0x%04lx\n", (unsigned long)page_old);
+	}
+
+	return 0;
 }
 
 static int phy_802_3_pwrctl(phy_config_t *pc, gmac_hal_context_t *hal, bool enable)
@@ -362,11 +535,14 @@ int gmac_phy_reset_hw(phy_config_t *phy_config_info)
 
 void gmac_glb_cfg_init(gmac_hal_context_t *hal)
 {
+	unsigned csr_hz;
+
 	GMAC_PRINTF("EQoS glb: 全局初始化 csr_base=%p\n", (void *)hal->csr_base);
 	GMAC_PRINTF("EQoS glb: 调用板级 EMAC 时钟与 PAD(gmac_board_emac_clock_and_pad_init)\n");
 	gmac_board_emac_clock_and_pad_init(hal);
-	GMAC_PRINTF("EQoS glb: 配置 MDIO MDC 分频(eqos_mdio_csr_apply)\n");
-	eqos_mdio_csr_apply(hal, EQOS_MDIO_CLK_CSR_DEFAULT);
+	csr_hz = gmac_eqos_get_csr_clock_hz();
+	GMAC_PRINTF("EQoS glb: 按 CSR 时钟选择并配置 MDIO MDC 分频\n");
+	eqos_mdio_csr_apply(hal, eqos_mdio_csr_from_clock(csr_hz));
 	gmac_phy_reset_hw(&g_eqos_phy_config);
 	gmac_board_delay_us(g_eqos_phy_config.post_hw_reset_delay_ms * 1000U);
 	GMAC_PRINTF("EQoS glb: 全局初始化完成\n");
@@ -388,6 +564,98 @@ void gmac_phy_802_3_basic_phy_deinit(phy_config_t *phy_cfg, gmac_hal_context_t *
 	phy_cfg->link_status = GMAC_LINK_DOWN;
 	if (phy_802_3_pwrctl(phy_cfg, hal, false))
 		GMAC_PRINTF("EQoS PHY: deinit 掉电写 BMCR 失败\n");
+}
+
+static gmac_speed_t vsc8541_speed_from_dacs(uint32_t dacs)
+{
+	switch ((dacs & VSC8541_DACS_SPEED_MASK) >> 3) {
+	case 0:
+		return GMAC_SPEED_10M;
+	case 1:
+		return GMAC_SPEED_100M;
+	case 2:
+	default:
+		return GMAC_SPEED_1000M;
+	}
+}
+
+int gmac_phy_vcs8541_get_link_info(phy_config_t *phy_cfg, gmac_hal_context_t *hal,
+				   gmac_port_link_t *link_status)
+{
+	uint32_t addr = (uint32_t)phy_cfg->addr;
+	uint32_t bmsr = 0;
+	uint32_t dacs = 0;
+	int link;
+
+	/* 对齐 P5：先回到标准页 0，再读 DACS/BMSR 获取 VSC8541 当前协商结果。 */
+	if (phy_page_select(phy_cfg, hal, 0x00U))
+		return -1;
+	if (gmac_read_phy_reg(hal, addr, DACS_PHY_DACS_REG_ADDR, &dacs))
+		return -1;
+
+	/*
+	 * BMSR.link_status 是 latch-low 位；连续读两次可以清掉旧的 down 事件，
+	 * 第二次更接近当前链路状态。
+	 */
+	(void)gmac_read_phy_reg(hal, addr, ETH_PHY_BMSR_REG_ADDR, &bmsr);
+	if (gmac_read_phy_reg(hal, addr, ETH_PHY_BMSR_REG_ADDR, &bmsr))
+		return -1;
+
+	link = (bmsr & BMSR_LINK_STATUS) ? GMAC_LINK_UP : GMAC_LINK_DOWN;
+	GMAC_PRINTF("EQoS PHY: link is %s\n", link == GMAC_LINK_UP ? "link_up!" : "link_down!");
+
+	if (phy_cfg->link_status != link) {
+		if (link == GMAC_LINK_UP) {
+			GMAC_PRINTF("EQoS PHY: linkup! vcs8541 speed(0:10M;1:100M;2:1000M)=%lu; "
+				    "duplex(0:half;1:full)=%lu\n",
+				    (unsigned long)((dacs & VSC8541_DACS_SPEED_MASK) >> 3),
+				    (unsigned long)((dacs & VSC8541_DACS_DUPLEX) ? 1U : 0U));
+		}
+		phy_cfg->link_status = link;
+	}
+
+	link_status->link_st = phy_cfg->link_status;
+	link_status->speed = vsc8541_speed_from_dacs(dacs);
+	link_status->duplex = (dacs & VSC8541_DACS_DUPLEX) ? GMAC_DUPLEX_FULL : GMAC_DUPLEX_HALF;
+	return 0;
+}
+
+int gmac_phy_vcs8541_auto_nego_restart(phy_config_t *phy_cfg, gmac_hal_context_t *hal)
+{
+	bmcr_reg_t bmcr = { .val = 0 };
+	uint32_t bmsr = 0;
+	uint32_t addr = (uint32_t)phy_cfg->addr;
+	unsigned to;
+	unsigned limit = phy_cfg->autonego_timeout_ms / 100U;
+
+	if (limit == 0U)
+		limit = 1U;
+
+	if (gmac_read_phy_reg(hal, addr, ETH_PHY_BMCR_REG_ADDR, &bmcr.val))
+		return -1;
+	GMAC_PRINTF("1-in gmac_phy_vcs8541_auto_nego_restart: bmcr.val=0x%lx....\n",
+		    (unsigned long)bmcr.val);
+	bmcr.en_auto_nego = 1;
+	bmcr.restart_auto_nego = 1;
+	GMAC_PRINTF("2-in gmac_phy_vcs8541_auto_nego_restart: bmcr.val=0x%lx....\n",
+		    (unsigned long)bmcr.val);
+	if (gmac_write_phy_reg(hal, addr, ETH_PHY_BMCR_REG_ADDR, bmcr.val))
+		return -1;
+
+	for (to = 0; to < limit; to++) {
+		gmac_board_delay_us(100000U);
+		if (gmac_read_phy_reg(hal, addr, ETH_PHY_BMSR_REG_ADDR, &bmsr))
+			return -1;
+		if (bmsr & BMSR_AN_COMPLETE) {
+			GMAC_PRINTF("restart_auto_nego complete!to=%u....\n", to);
+			return 0;
+		}
+		GMAC_PRINTF("wait auto_nego_complete ,to=%u....\n", to);
+	}
+
+	GMAC_PRINTF("EQoS PHY: auto negotiation timeout !! bmsr.val=0x%lx\n",
+		    (unsigned long)bmsr);
+	return -1;
 }
 
 /*
@@ -414,7 +682,7 @@ void gmac_phy_vcs8541_init(phy_config_t *phy_cfg, gmac_hal_context_t *hal,
 		int d;
 
 		GMAC_PRINTF("EQoS PHY: PHY 地址为 AUTO,在 MDIO 0~31 上扫描 IDR1…\n");
-		if (phy_detect_addr(hal, &d)) {
+		if (gmac_phy_detect_phy_addr(hal, &d)) {
 			GMAC_PRINTF("EQoS PHY: 自动扫描未找到 PHY,终止初始化\n");
 			return;
 		}
@@ -461,6 +729,8 @@ void gmac_phy_vcs8541_init(phy_config_t *phy_cfg, gmac_hal_context_t *hal,
 	rgmii_ctrl_reg_val.val &= ~(1U << 11);
 	rgmii_ctrl_reg_val.rx_clk_delay = s_rgmii_delay.emacx_rx_clk_delay & 7U;
 	rgmii_ctrl_reg_val.tx_clk_delay = s_rgmii_delay.emacx_tx_clk_delay & 7U;
+	rgmii_ctrl_reg_val.rgmii_txd_reversal = s_rgmii_tx_clk_reverse ? 1U : 0U;
+	rgmii_ctrl_reg_val.rgmii_rxd_reversal = s_rgmii_rx_clk_reverse ? 1U : 0U;
 	PHY_INIT_CHECK(gmac_write_phy_reg(hal, addr, GMAC_PHY_RCR_REG_ADDR, rgmii_ctrl_reg_val.val) != 0,
 		       "写 RCR");
 	GMAC_PRINTF("EQoS PHY: RCR 已写 raw=0x%04lx\n", (unsigned long)rgmii_ctrl_reg_val.val);

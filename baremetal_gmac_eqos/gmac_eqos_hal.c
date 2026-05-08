@@ -55,6 +55,65 @@ static const char *eqos_speed_str(gmac_speed_t s)
 	}
 }
 
+static const char *eqos_link_str(int link)
+{
+	return link == GMAC_LINK_UP ? "UP" : "DOWN";
+}
+
+/*
+ * 对齐 P5:
+ *   ut_isr_alloc(source, priority, handler, param)
+ *   ut_isr_free(source)
+ *
+ * 真实板级请在 BSP 提供这些符号的强实现；当前工程先在 board_stub 提供 weak 空实现，
+ * 以便测试代码在无 IRQ 环境下仍可编译和跑轮询降级路径。
+ */
+extern void intr_handler_set(int source, void (*isr_handle)(void *), void *param);
+extern void esprv_intc_int_set_priority(int source, int priority);
+extern void esprv_intc_int_enable(int source);
+extern void esprv_intc_int_disable(int source);
+
+#ifndef ETS_GMAC_SBD_INTR_INUM
+#define ETS_GMAC_SBD_INTR_INUM 0
+#endif
+
+static volatile bool g_gmac_packet_received;
+
+void ut_isr_alloc(int source, int priority, void (*isr_handle)(void *), void *param)
+{
+	intr_handler_set(source, isr_handle, param);
+	esprv_intc_int_set_priority(source, priority);
+	esprv_intc_int_enable(source);
+}
+
+void ut_isr_free(int source)
+{
+	esprv_intc_int_disable(source);
+	intr_handler_set(source, NULL, NULL);
+}
+
+void gmac_isr_default_handler(void *args)
+{
+	gmac_hal_context_t *hal = (gmac_hal_context_t *)args;
+	uint32_t intr_stat;
+	uint32_t en;
+
+	/*
+	 * DWMAC4/EQoS 这里用 DMA_CHAN_STATUS + DMA_CHAN_INTR_ENA 获取并清中断。
+	 * 与 P5 emac_hal_get_intr_status + clear_corresponding_intr 的语义一致。
+	 */
+	intr_stat = gmac_io_read32(hal->csr_base + (uintptr_t)DMA_CHAN_STATUS);
+	en = gmac_io_read32(hal->csr_base + (uintptr_t)DMA_CHAN_INTR_ENA);
+	intr_stat &= en;
+	if (intr_stat)
+		gmac_io_write32(hal->csr_base + (uintptr_t)DMA_CHAN_STATUS, intr_stat); /* W1C */
+
+	if (intr_stat & DMA_CHAN_STATUS_TI)
+		GMAC_PRINTF("EQoS ISR: Tx int complete\n");
+	if (intr_stat & DMA_CHAN_STATUS_RI)
+		g_gmac_packet_received = true;
+}
+
 typedef struct {
 	struct eqos_dma_desc *tx_desc;
 	struct eqos_dma_desc *rx_desc;
@@ -99,6 +158,11 @@ static inline void reg_wr(gmac_hal_context_t *h, uint32_t off, uint32_t v)
 void gmac_eqos_set_csr_clock_hz(unsigned hz)
 {
 	s_csr_hz = hz;
+}
+
+unsigned gmac_eqos_get_csr_clock_hz(void)
+{
+	return s_csr_hz;
 }
 
 static int dma_soft_reset(gmac_hal_context_t *h)
@@ -350,9 +414,9 @@ static void gmac_hal_init_mac_default(gmac_hal_context_t *hal)
 
 	if (s_csr_hz >= 1000000U) {
 		/*
-		 * GMAC4_MAC_ONEUS_TIC_COUNTER:
+		 * GMAC4_MAC_ONEUS_TIC_COUNTER: 告诉mac多少个 CSR clock cycle 等于 1 微秒
 		 * 写入 “CSR 时钟周期数 - 1”，让 MAC 内部 1us tick 与实际 CSR clock 对齐。
-		 * PTP/部分超时计数会依赖这个值；不知道 CSR 时钟时跳过，避免写错。
+		 * PTP/部分超时计数会依赖这个值；不知道 CSR 时钟时跳过（e.g.:可以设置为 0），避免写错。
 		 */
 		reg_wr(hal, GMAC4_MAC_ONEUS_TIC_COUNTER,
 		       (s_csr_hz / 1000000U) - 1U);
@@ -854,11 +918,217 @@ void gmac_eqos_test_bind(uintptr_t csr_base, unsigned csr_clock_hz)
 {
 	s_test_csr = csr_base;
 	s_test_csr_hz = csr_clock_hz;
+	gmac_eqos_set_csr_clock_hz(csr_clock_hz);
 	GMAC_PRINTF("EQoS test: bind csr_base=%p csr_clock_hz=%u（用于 1us 计数器等）\n",
 		    (void *)csr_base, csr_clock_hz);
 }
 
-void test_mac_near_end_loopback_force_link(gmac_speed_t force_link_speed)
+void test_gmac_env_basic(uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+	uint32_t version;
+	uint32_t hw_feature0;
+	uint32_t hw_feature1;
+	uint32_t hw_feature2;
+	uint32_t hw_feature3;
+	uint32_t phyif;
+	uint32_t vlan_old;
+	uint32_t vlan_test = 0x55aaU;
+	uint32_t vlan_readback;
+	uint8_t snpsver;
+	uint8_t userver;
+
+	GMAC_PRINTF("\n======== GMAC env basic test (EQoS baremetal) 开始 ========\n");
+
+	/*
+	 * 让 env basic test 自己完成测试环境绑定，调用侧只需要传入 CSR 基址和 CSR 时钟。
+	 * 等价于用户手动先调用：
+	 *   gmac_eqos_test_bind(csr_base, csr_clock_hz);
+	 * 再进入环境检查。
+	 */
+	gmac_eqos_test_bind(csr_base, csr_clock_hz);
+
+	ctx.csr_base = s_test_csr;
+	if (ctx.csr_base == 0) {
+		GMAC_PRINTF("EQoS env: 错误 — csr_base 为 0，请传入有效 EQoS CSR 基址\n");
+		return;
+	}
+
+	/*
+	 * 对齐 P5 TEST_CASE(\"GMAC env basic test\", \"[P5 FPGA]\") 的第一步：
+	 * 确认 GMAC CSR 窗口可访问，读取 version / feature 等只读关键信息。
+	 */
+	GMAC_PRINTF("EQoS env: csr_base=%p csr_clock_hz=%u\n",
+		    (void *)ctx.csr_base, s_test_csr_hz);
+	GMAC_PRINTF("EQoS env: GMAC4_VERSION addr=%p, GMAC_HW_FEATURE0 addr=%p\n",
+		    (void *)(ctx.csr_base + GMAC4_VERSION),
+		    (void *)(ctx.csr_base + GMAC_HW_FEATURE0));
+
+	version = reg_rd(&ctx, GMAC4_VERSION);
+	snpsver = (uint8_t)(version & 0xffU);
+	userver = (uint8_t)((version >> 8) & 0xffU);
+	GMAC_PRINTF("EQoS env: GMAC4_VERSION=0x%08lx, SNPSVER=0x%02x, USERVER=0x%02x\n",
+		    (unsigned long)version, snpsver, userver);
+	if (version == 0 || version == 0xffffffffU) {
+		GMAC_PRINTF("EQoS env: FAIL — version 读值异常，检查 csr_base/时钟/复位/MMIO\n");
+		return;
+	}
+	if (snpsver != 0x54U) {
+		GMAC_PRINTF("EQoS env: WARN — 期望 EQoS/DWMAC 5.40a SNPSVER≈0x54，当前=0x%02x\n",
+			    snpsver);
+	} else {
+		GMAC_PRINTF("EQoS env: PASS — SNPSVER 匹配 5.40a\n");
+	}
+
+	/*
+	 * Hardware Feature 寄存器是只读能力描述：
+	 * - FEATURE0 常见包含 GMII/RGMII、checksum、multi-MAC、TSO/VLAN 等能力。
+	 * - FEATURE1/2/3 常见包含 FIFO/queue/channel/PTP/PPS/5.x 扩展能力。
+	 * 这里只打印原始值，具体 bit 请对照 Linux dwmac4_dma.c / dwmac4.h 或 databook。
+	 */
+	hw_feature0 = reg_rd(&ctx, GMAC_HW_FEATURE0);
+	hw_feature1 = reg_rd(&ctx, GMAC_HW_FEATURE1);
+	hw_feature2 = reg_rd(&ctx, GMAC_HW_FEATURE2);
+	hw_feature3 = reg_rd(&ctx, GMAC_HW_FEATURE3);
+	GMAC_PRINTF("EQoS env: HW_FEATURE0=0x%08lx\n", (unsigned long)hw_feature0);
+	GMAC_PRINTF("EQoS env: HW_FEATURE1=0x%08lx\n", (unsigned long)hw_feature1);
+	GMAC_PRINTF("EQoS env: HW_FEATURE2=0x%08lx\n", (unsigned long)hw_feature2);
+	GMAC_PRINTF("EQoS env: HW_FEATURE3=0x%08lx\n", (unsigned long)hw_feature3);
+
+	phyif = reg_rd(&ctx, GMAC_PHYIF_CONTROL_STATUS);
+	GMAC_PRINTF("EQoS env: GMAC_PHYIF_CONTROL_STATUS=0x%08lx（RGMII link/update 等状态）\n",
+		    (unsigned long)phyif);
+
+	/*
+	 * 可恢复寄存器读写测试：
+	 * P5 用 vlan_tag_reg 写 0x55aa 后读回再恢复。DWMAC4/EQoS 中 VLAN_TAG offset
+	 * 为 0x50（Linux stmmac_vlan.h: VLAN_TAG），这里采用同样思路验证 MAC CSR 写通路。
+	 *
+	 * 注意：该测试会短暂改写 VLAN_TAG，因此建议在 MAC 未启动收发时调用；
+	 * 函数最后会把旧值写回。
+	 */
+	vlan_old = reg_rd(&ctx, GMAC_VLAN_TAG);
+	GMAC_PRINTF("EQoS env: VLAN_TAG old=0x%08lx，写入测试值 0x%08lx\n",
+		    (unsigned long)vlan_old, (unsigned long)vlan_test);
+	reg_wr(&ctx, GMAC_VLAN_TAG, vlan_test);
+	vlan_readback = reg_rd(&ctx, GMAC_VLAN_TAG);
+	if (vlan_readback == vlan_test) {
+		GMAC_PRINTF("EQoS env: PASS — VLAN_TAG write/readback OK (0x%08lx)\n",
+			    (unsigned long)vlan_readback);
+	} else {
+		GMAC_PRINTF("EQoS env: FAIL — VLAN_TAG readback=0x%08lx, expected=0x%08lx\n",
+			    (unsigned long)vlan_readback, (unsigned long)vlan_test);
+	}
+	reg_wr(&ctx, GMAC_VLAN_TAG, vlan_old);
+	GMAC_PRINTF("EQoS env: VLAN_TAG restored=0x%08lx\n",
+		    (unsigned long)reg_rd(&ctx, GMAC_VLAN_TAG));
+
+	GMAC_PRINTF("======== GMAC env basic test (EQoS baremetal) 结束 ========\n\n");
+}
+
+void test_get_phy_addr(uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+
+	GMAC_PRINTF("\n======== GET_PHY_ADDR test (EQoS baremetal) 开始 ========\n");
+	gmac_eqos_test_bind(csr_base, csr_clock_hz);
+	ctx.csr_base = s_test_csr;
+	if (ctx.csr_base == 0) {
+		GMAC_PRINTF("EQoS GET_PHY_ADDR: 错误 — csr_base 为 0\n");
+		return;
+	}
+
+	/*
+	 * 对齐 P5 GET_PHY_ADDR test：
+	 * 先做全局/板级/MDIO 初始化，再通过 Clause22 IDR1/IDR2 扫描 PHY 地址。
+	 */
+	gmac_glb_cfg_init(&ctx);
+	if (g_eqos_phy_config.addr == GMAC_PHY_ADDR_AUTO) {
+		if (gmac_phy_detect_phy_addr(&ctx, &g_eqos_phy_config.addr)) {
+			GMAC_PRINTF("EQoS GET_PHY_ADDR: FAIL — 未找到 PHY\n");
+			GMAC_PRINTF("======== GET_PHY_ADDR test (EQoS baremetal) 结束 ========\n\n");
+			return;
+		}
+	}
+	if (g_eqos_phy_config.addr != GMAC_PHY_ADDR_AUTO) {
+		GMAC_PRINTF("EQoS GET_PHY_ADDR: Updated PHY address = %d\n",
+			    g_eqos_phy_config.addr);
+	}
+	GMAC_PRINTF("======== GET_PHY_ADDR test (EQoS baremetal) 结束 ========\n\n");
+}
+
+void test_smi_phy_reg_read_write(uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+
+	GMAC_PRINTF("\n======== SMI_INTF:PHY_REG_READ_WRITE test (EQoS baremetal) 开始 ========\n");
+	gmac_eqos_test_bind(csr_base, csr_clock_hz);
+	ctx.csr_base = s_test_csr;
+	if (ctx.csr_base == 0) {
+		GMAC_PRINTF("EQoS SMI: 错误 — csr_base 为 0\n");
+		return;
+	}
+
+	gmac_glb_cfg_init(&ctx);
+	if (gmac_phy_vcs8541_reg_read_write(&g_eqos_phy_config, &ctx))
+		GMAC_PRINTF("EQoS SMI: FAIL — gmac_phy_vcs8541_reg_read_write failed\n");
+
+	GMAC_PRINTF("======== SMI_INTF:PHY_REG_READ_WRITE test (EQoS baremetal) 结束 ========\n\n");
+}
+
+void test_phy_auto_negotiation_link_partner(uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+	gmac_port_link_t link_status = { GMAC_LINK_DOWN, GMAC_SPEED_10M, GMAC_DUPLEX_HALF };
+	int link_status_old = GMAC_LINK_DOWN;
+	unsigned time_cnt = 0;
+
+	GMAC_PRINTF("\n======== PHY auto_negotiation test(link_partner) (EQoS baremetal) 开始 ========\n");
+	GMAC_PRINTF("EQoS AN: 请连接真实 link partner（交换机/PC/对端 PHY），本测试最多观察约 10 秒 link-up 状态\n");
+	gmac_eqos_test_bind(csr_base, csr_clock_hz);
+	ctx.csr_base = s_test_csr;
+	if (ctx.csr_base == 0) {
+		GMAC_PRINTF("EQoS AN: 错误 — csr_base 为 0\n");
+		return;
+	}
+
+	gmac_glb_cfg_init(&ctx);
+	gmac_phy_vcs8541_init(&g_eqos_phy_config, &ctx, NULL);
+	if (g_eqos_phy_config.addr == GMAC_PHY_ADDR_AUTO) {
+		GMAC_PRINTF("EQoS AN: FAIL — PHY init 后仍未获得 PHY 地址\n");
+		return;
+	}
+
+	if (gmac_phy_vcs8541_auto_nego_restart(&g_eqos_phy_config, &ctx))
+		GMAC_PRINTF("EQoS AN: WARN — auto-negotiation 未在超时时间内完成，继续观察 link 状态\n");
+
+	GMAC_PRINTF("----------- GMAC PHY wait for connection -------\n");
+	while (time_cnt < 15U) {
+		if (gmac_phy_vcs8541_get_link_info(&g_eqos_phy_config, &ctx, &link_status)) {
+			GMAC_PRINTF("EQoS AN: WARN — read link info failed\n");
+		} else if (link_status_old != link_status.link_st) {
+			link_status_old = link_status.link_st;
+			GMAC_PRINTF("EQoS AN: link %s, speed=%s, duplex=%s\n",
+				    eqos_link_str(link_status.link_st),
+				    eqos_speed_str(link_status.speed),
+				    link_status.duplex == GMAC_DUPLEX_FULL ? "full" : "half");
+		} else if (link_status.link_st == GMAC_LINK_UP) {
+			GMAC_PRINTF("EQoS AN: link still UP (%u/10 sec), speed=%s, duplex=%s\n",
+				    time_cnt, eqos_speed_str(link_status.speed),
+				    link_status.duplex == GMAC_DUPLEX_FULL ? "full" : "half");
+			if (time_cnt >= 10U)
+				break;
+		}
+
+		gmac_board_delay_us(1000000U);
+		time_cnt++;
+	}
+
+	GMAC_PRINTF("======== PHY auto_negotiation test(link_partner) (EQoS baremetal) 结束 ========\n\n");
+}
+
+void test_mac_near_end_loopback_force_link(uintptr_t csr_base, unsigned csr_clock_hz,
+					   gmac_speed_t force_link_speed)
 {
 	static gmac_hal_context_t ctx;
 	const uint16_t test_len_max = 1514U;
@@ -869,9 +1139,15 @@ void test_mac_near_end_loopback_force_link(gmac_speed_t force_link_speed)
 	GMAC_PRINTF("EQoS test: 目标 MAC 速率=%s（与 PHY force 对齐）\n",
 		    eqos_speed_str(force_link_speed));
 
+	/*
+	 * 让 loopback test 自己完成测试环境绑定，调用侧只需要传入 CSR 基址、
+	 * CSR 时钟和目标速率，不再需要提前单独调用 gmac_eqos_test_bind()。
+	 */
+	gmac_eqos_test_bind(csr_base, csr_clock_hz);
+
 	ctx.csr_base = s_test_csr;
 	if (ctx.csr_base == 0) {
-		GMAC_PRINTF("EQoS test: 错误 — 请先调用 gmac_eqos_test_bind(csr_base, csr_hz)\n");
+		GMAC_PRINTF("EQoS test: 错误 — csr_base 为 0，请传入有效 EQoS CSR 基址\n");
 		return;
 	}
 	gmac_eqos_set_csr_clock_hz(s_test_csr_hz);
@@ -949,4 +1225,632 @@ void test_mac_near_end_loopback_force_link(gmac_speed_t force_link_speed)
 	gmac_phy_802_3_basic_phy_deinit(&g_eqos_phy_config, &ctx);
 	gmac_mac_del();
 	GMAC_PRINTF("======== EQoS test_mac_near_end_loopback_force_link 结束 ========\n\n");
+}
+
+/*
+ * 对齐 P5 test_phy_near_end_loopback_force_link(force_link_speed)：
+ * emac tx -> PHY RX -> PHY 近端环回 -> PHY TX -> emac rx。
+ * 裸机入口额外带 csr_base/csr_clock_hz，并在函数内部完成测试环境绑定。
+ */
+void test_phy_near_end_loopback_force_link(uintptr_t csr_base, unsigned csr_clock_hz,
+					   gmac_speed_t force_link_speed)
+{
+	static gmac_hal_context_t ctx;
+	const uint16_t test_len_max = 1514U;
+	static const uint16_t test_len[] = {64, 128, 256, 512, 768, 1024, 1280, 1466, 1514};
+	uint8_t *pkt;
+	phy_extra_config_t phy_extra = {
+		.force_link_speed = force_link_speed,
+		.force_duplex = GMAC_DUPLEX_FULL,
+		.phy_loopback_en = true,
+		.is_phy_near_end_loopback = true,
+	};
+
+	GMAC_PRINTF("\n======== EQoS test_phy_near_end_loopback_force_link 开始 ========\n");
+	GMAC_PRINTF("EQoS PHY-LB: force speed=%s, PHY near-end loopback enable\n",
+		    eqos_speed_str(force_link_speed));
+
+	/*
+	 * 让 PHY near-end loopback test 自己完成环境绑定，调用侧只需要传入
+	 * CSR 基址、CSR 时钟和目标速率。
+	 */
+	gmac_eqos_test_bind(csr_base, csr_clock_hz);
+
+	ctx.csr_base = s_test_csr;
+	if (ctx.csr_base == 0) {
+		GMAC_PRINTF("EQoS PHY-LB: 错误 — csr_base 为 0，请传入有效 EQoS CSR 基址\n");
+		return;
+	}
+	gmac_eqos_set_csr_clock_hz(s_test_csr_hz);
+	GMAC_PRINTF("EQoS PHY-LB: 使用已绑定 CSR base=%p, csr_clock_hz=%u\n",
+		    (void *)ctx.csr_base, s_test_csr_hz);
+
+	s_dma = gmac_eqos_new_dma();
+	pkt = (uint8_t *)s_dma->tx_buf[0];
+
+	memset(pkt, 0, test_len_max);
+	{
+		gmac_frame_t *f = (gmac_frame_t *)pkt;
+		const uint8_t src[] = { MAC_TEST_SRC_ADDR };
+
+		f->proto = GMAC_HTONS(GMAC_MY_NORMAL_PKT_TYPE);
+		memcpy(f->src, src, sizeof(f->src));
+		memset(f->dest, 0xff, sizeof(f->dest));
+		for (int i = 0; i < (int)(test_len_max - ETH_HEADER_LEN); ++i)
+			f->data[i] = (uint8_t)(i & 0xff);
+	}
+	GMAC_PRINTF("EQoS PHY-LB: transmit content ready\n");
+
+	GMAC_PRINTF("EQoS PHY-LB: 阶段 1 — 板级/MDIO/PHY force link + PHY 近端环回\n");
+	gmac_glb_cfg_init(&ctx);
+	gmac_phy_vcs8541_init(&g_eqos_phy_config, &ctx, &phy_extra);
+
+	GMAC_PRINTF("EQoS PHY-LB: 阶段 2 — MAC/DMA 初始化 + 速率/双工 + 启动\n");
+	gmac_mac_init(&ctx);
+	gmac_mac_set_speed(&ctx, phy_extra.force_link_speed);
+	gmac_mac_set_duplex(&ctx, phy_extra.force_duplex);
+	gmac_mac_start(&ctx);
+
+	/* 对齐 P5：等待 PHY 近端环回与 MAC 数据路径稳定，避免起始几个包丢失。 */
+	gmac_board_delay_us(100000U);
+
+	GMAC_PRINTF("EQoS PHY-LB: 阶段 3 — 多包长 PHY 近端环回发送/校验\n");
+	for (size_t i = 0; i < sizeof(test_len) / sizeof(test_len[0]); i++) {
+		for (unsigned j = 0; j < 2U; j++) {
+			int check_recv_timeout = 100;
+
+			GMAC_PRINTF("len:%u _broadcast send %u times!\n",
+				    test_len[i], j + 1U);
+			if (gmac_mac_transmit(&ctx, pkt, test_len[i]) != 0) {
+				GMAC_PRINTF("EQoS PHY-LB: TX fail len=%u\n", test_len[i]);
+				continue;
+			}
+			gmac_board_delay_us(20000U);
+
+			while (check_recv_timeout--) {
+				if (gmac_get_receive_finish_int_flag(&ctx) &&
+				    gmac_receive_frame(&ctx, NULL, true, true, false)) {
+					GMAC_PRINTF("len:%u phy-nearend-loopback pass !!!\n",
+						    test_len[i]);
+					break;
+				}
+				gmac_board_delay_us(20000U);
+			}
+			if (check_recv_timeout <= 0) {
+				GMAC_PRINTF("Fail: phy-near end loopback received timeout, "
+					    "check_recv_timeout=%d !!!\n",
+					    check_recv_timeout);
+			}
+		}
+	}
+
+	GMAC_PRINTF("EQoS PHY-LB: 阶段 4 — 停机与 PHY deinit\n");
+	gmac_mac_stop(&ctx);
+	gmac_phy_802_3_basic_phy_deinit(&g_eqos_phy_config, &ctx);
+	gmac_mac_del();
+	GMAC_PRINTF("======== EQoS test_phy_near_end_loopback_force_link 结束 ========\n\n");
+}
+
+/*
+ * 对齐 P5:
+ * TEST_CASE("GMAC Interrupt test(receive pkt,force_link_mac)", "[P5 FPGA]")
+ *
+ * 当前 EQoS 版保留同样的核心验证点：
+ * - ut_isr_alloc 注册默认 ISR
+ * - 发包后等待 ISR 设置 g_gmac_packet_received
+ * - 再进入 RX 描述符解析校验
+ */
+void test_gmac_interrupt_receive_pkt_force_link_mac(uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+	const uint16_t test_len_max = 1514U;
+	static const uint16_t test_len[] = {64, 128, 256, 512, 1024, 1514};
+	const unsigned send_times_every_len = 2U;
+	int recv_isr_wait_us;
+	gmac_speed_t force_link_speed;
+	uint8_t *pkt;
+	phy_extra_config_t phy_extra;
+
+#if (GMAC_PHY_INTF == EQOS_PHY_INTF_RGMII)
+	force_link_speed = GMAC_SPEED_1000M;
+#else
+	force_link_speed = GMAC_SPEED_100M;
+#endif
+	recv_isr_wait_us = (force_link_speed == GMAC_SPEED_1000M) ? 20 : 200;
+
+	phy_extra.force_link_speed = force_link_speed;
+	phy_extra.force_duplex = GMAC_DUPLEX_FULL;
+	phy_extra.phy_loopback_en = false;
+	phy_extra.is_phy_near_end_loopback = false;
+
+	GMAC_PRINTF("\n======== GMAC Interrupt test(receive pkt,force_link_mac) 开始 ========\n");
+	GMAC_PRINTF("EQoS IRQ test: force speed=%s, recv_isr_wait_us=%d\n",
+		    eqos_speed_str(force_link_speed), recv_isr_wait_us);
+
+	gmac_eqos_test_bind(csr_base, csr_clock_hz);
+	ctx.csr_base = s_test_csr;
+	if (ctx.csr_base == 0) {
+		GMAC_PRINTF("EQoS IRQ test: 错误 — csr_base 为 0，请传入有效 EQoS CSR 基址\n");
+		return;
+	}
+	gmac_eqos_set_csr_clock_hz(s_test_csr_hz);
+
+	s_dma = gmac_eqos_new_dma();
+	pkt = (uint8_t *)s_dma->tx_buf[0];
+	memset(pkt, 0, test_len_max);
+	{
+		gmac_frame_t *f = (gmac_frame_t *)pkt;
+		const uint8_t src[] = { MAC_TEST_SRC_ADDR };
+
+		f->proto = GMAC_HTONS(GMAC_MY_NORMAL_PKT_TYPE);
+		memcpy(f->src, src, sizeof(f->src));
+		memset(f->dest, 0xff, sizeof(f->dest));
+		for (int i = 0; i < (int)(test_len_max - ETH_HEADER_LEN); ++i)
+			f->data[i] = (uint8_t)(i & 0xff);
+	}
+	GMAC_PRINTF("EQoS IRQ test: transmit content ready\n");
+
+	ut_isr_alloc(ETS_GMAC_SBD_INTR_INUM, 1, gmac_isr_default_handler, (void *)(&ctx));
+
+	gmac_glb_cfg_init(&ctx);
+	gmac_phy_vcs8541_init(&g_eqos_phy_config, &ctx, &phy_extra);
+	gmac_mac_init(&ctx);
+	gmac_mac_near_loopback_prepare(&ctx);
+	gmac_mac_set_speed(&ctx, force_link_speed);
+	gmac_mac_set_duplex(&ctx, GMAC_DUPLEX_FULL);
+	gmac_mac_start(&ctx);
+
+	gmac_board_delay_us(100000U);
+
+	for (size_t i = 0; i < sizeof(test_len) / sizeof(test_len[0]); i++) {
+		for (unsigned j = 0; j < send_times_every_len; j++) {
+			int wait_isr = recv_isr_wait_us;
+			int check_recv_timeout = 100;
+
+			GMAC_PRINTF("len:%u _broadcast send %u/%u times!\n",
+				    test_len[i], j + 1U, send_times_every_len);
+			g_gmac_packet_received = false;
+			(void)gmac_mac_transmit(&ctx, pkt, (uint32_t)test_len[i]);
+
+			/* 等 ISR 置位；在未真正接 IRQ 的环境下退化为轮询 status。 */
+			while (!g_gmac_packet_received && (wait_isr-- > 0)) {
+				if (gmac_get_receive_finish_int_flag(&ctx))
+					g_gmac_packet_received = true;
+				else
+					gmac_board_delay_us(1U);
+			}
+			if (!g_gmac_packet_received) {
+				GMAC_PRINTF("interrupt rx timeout,len:%u GMAC Interrupt test err !!!\n",
+					    test_len[i]);
+				continue;
+			}
+
+			while (check_recv_timeout--) {
+				if (gmac_receive_frame(&ctx, NULL, true, true, false)) {
+					GMAC_PRINTF("len:%u interrupt receive pass !!!\n", test_len[i]);
+					break;
+				}
+				gmac_board_delay_us(20000U);
+			}
+			if (check_recv_timeout <= 0) {
+				GMAC_PRINTF("Fail: interrupt receive frame timeout len=%u !!!\n",
+					    test_len[i]);
+			}
+		}
+	}
+
+	ut_isr_free(ETS_GMAC_SBD_INTR_INUM);
+	gmac_mac_stop(&ctx);
+	gmac_phy_802_3_basic_phy_deinit(&g_eqos_phy_config, &ctx);
+	gmac_mac_del();
+	GMAC_PRINTF("======== GMAC Interrupt test(receive pkt,force_link_mac) 结束 ========\n\n");
+}
+
+static void eqos_prepare_broadcast_test_packet(uint8_t *pkt, uint16_t test_len_max)
+{
+	gmac_frame_t *f = (gmac_frame_t *)pkt;
+	const uint8_t src[] = { MAC_TEST_SRC_ADDR };
+
+	memset(pkt, 0, test_len_max);
+	f->proto = GMAC_HTONS(GMAC_MY_NORMAL_PKT_TYPE);
+	memcpy(f->src, src, sizeof(f->src));
+	memset(f->dest, 0xff, sizeof(f->dest));
+	for (int i = 0; i < (int)(test_len_max - ETH_HEADER_LEN); ++i)
+		f->data[i] = (uint8_t)(i & 0xff);
+}
+
+static void eqos_stop_and_deinit(gmac_hal_context_t *ctx)
+{
+	gmac_mac_stop(ctx);
+	gmac_phy_802_3_basic_phy_deinit(&g_eqos_phy_config, ctx);
+	gmac_mac_del();
+}
+
+static int eqos_setup_link_partner(gmac_hal_context_t *ctx, uintptr_t csr_base,
+				   unsigned csr_clock_hz, bool start_mac_after_link)
+{
+	gmac_port_link_t link_status = { GMAC_LINK_DOWN, GMAC_SPEED_100M, GMAC_DUPLEX_FULL };
+	unsigned sec = 0;
+
+	gmac_eqos_test_bind(csr_base, csr_clock_hz);
+	ctx->csr_base = s_test_csr;
+	if (ctx->csr_base == 0) {
+		GMAC_PRINTF("EQoS: 错误 — csr_base 为 0\n");
+		return -1;
+	}
+	gmac_eqos_set_csr_clock_hz(s_test_csr_hz);
+
+	s_dma = gmac_eqos_new_dma();
+
+	gmac_glb_cfg_init(ctx);
+	gmac_phy_vcs8541_init(&g_eqos_phy_config, ctx, NULL);
+	gmac_mac_init(ctx);
+
+	if (gmac_phy_vcs8541_auto_nego_restart(&g_eqos_phy_config, ctx))
+		GMAC_PRINTF("EQoS: WARN — auto-negotiation 超时，继续等待 link\n");
+
+	for (sec = 0; sec < 15U; sec++) {
+		if (!gmac_phy_vcs8541_get_link_info(&g_eqos_phy_config, ctx, &link_status) &&
+		    link_status.link_st == GMAC_LINK_UP)
+			break;
+		gmac_board_delay_us(1000000U);
+	}
+	if (link_status.link_st != GMAC_LINK_UP) {
+		GMAC_PRINTF("EQoS: FAIL — link partner 未在超时内 link-up\n");
+		return -1;
+	}
+
+	if (start_mac_after_link) {
+		gmac_mac_set_speed(ctx, link_status.speed);
+		gmac_mac_set_duplex(ctx, link_status.duplex);
+		gmac_mac_start(ctx);
+	}
+	return 0;
+}
+
+static int eqos_setup_force_link_phy_near_loopback(gmac_hal_context_t *ctx, uintptr_t csr_base,
+						    unsigned csr_clock_hz, gmac_speed_t speed)
+{
+	phy_extra_config_t phy_extra = {
+		.force_link_speed = speed,
+		.force_duplex = GMAC_DUPLEX_FULL,
+		.phy_loopback_en = true,
+		.is_phy_near_end_loopback = true,
+	};
+
+	gmac_eqos_test_bind(csr_base, csr_clock_hz);
+	ctx->csr_base = s_test_csr;
+	if (ctx->csr_base == 0) {
+		GMAC_PRINTF("EQoS: 错误 — csr_base 为 0\n");
+		return -1;
+	}
+	gmac_eqos_set_csr_clock_hz(s_test_csr_hz);
+
+	s_dma = gmac_eqos_new_dma();
+	gmac_glb_cfg_init(ctx);
+	gmac_phy_vcs8541_init(&g_eqos_phy_config, ctx, &phy_extra);
+	gmac_mac_init(ctx);
+	gmac_mac_set_speed(ctx, speed);
+	gmac_mac_set_duplex(ctx, GMAC_DUPLEX_FULL);
+	gmac_mac_start(ctx);
+	return 0;
+}
+
+/*
+ * here not linkpartner, need to configure phy forced link(e.g.1000Mbps, let PHY generate RX clock)
+ * emac tx -> phyrx -> phytx -> emac rx
+ * debug/determine rgmii txclk_delay & rxclk_delay or tx/rx reverse parameter
+ */
+void test_debug_determine_rgmii_1000m_tx_rx_clk_delay_or_reverse_para_base_on_phy_near_end_loopback_force_link(
+	uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+	const uint16_t test_len_max = 1514U;
+	static const uint16_t test_len[] = {64, 128, 256, 512, 768, 1024, 1280, 1466, 1514};
+	uint8_t *pkt;
+	const uint8_t rev_flags[2] = {0, 1};
+	const uint8_t delays[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+	uint8_t pass_num = 0;
+	uint8_t pass_combo_para[64] = {0};
+	bool fail_flag = false;
+
+	GMAC_PRINTF("\n======== debug/determine rgmii_1000m tx/rx clk_delay or reverse para base on phy near end loopback(force_link) 开始 ========\n");
+
+	s_dma = gmac_eqos_new_dma();
+	pkt = (uint8_t *)s_dma->tx_buf[0];
+	eqos_prepare_broadcast_test_packet(pkt, test_len_max);
+
+	for (unsigned tri = 0; tri < 2; tri++) {
+		for (unsigned trd = 0; trd < 8; trd++) {
+			for (unsigned rri = 0; rri < 2; rri++) {
+				for (unsigned rrd = 0; rrd < 8; rrd++) {
+					GMAC_PRINTF("EQoS RGMII scan: tx_rev=%u tx_delay=%u rx_rev=%u rx_delay=%u\n",
+						    rev_flags[tri], delays[trd], rev_flags[rri], delays[rrd]);
+					gmac_phy_set_rgmii_timing(delays[trd], delays[rrd],
+								  rev_flags[tri] != 0U,
+								  rev_flags[rri] != 0U);
+					if (eqos_setup_force_link_phy_near_loopback(&ctx, csr_base,
+										    csr_clock_hz,
+										    GMAC_SPEED_1000M)) {
+						eqos_stop_and_deinit(&ctx);
+						continue;
+					}
+					gmac_board_delay_us(100000U);
+					for (size_t i = 0; i < sizeof(test_len) / sizeof(test_len[0]); i++) {
+						int check_recv_timeout = 5; /* 5 * 20ms = 100ms */
+
+						fail_flag = false;
+						(void)gmac_mac_transmit(&ctx, pkt, test_len[i]);
+						gmac_board_delay_us(20000U);
+
+						while (check_recv_timeout--) {
+							if (gmac_get_receive_finish_int_flag(&ctx)) {
+								bool recv_finish_flag =
+									gmac_receive_frame(&ctx, NULL, true, true, false);
+
+								if (recv_finish_flag) {
+									break;
+								}
+								GMAC_PRINTF("phy-nearend-loopback fail at [x,y:m,n] = [%u,%u:%u,%u] @test_len=%u\n",
+									    tri, rri, trd, rrd, test_len[i]);
+								fail_flag = true;
+								break;
+							}
+							gmac_board_delay_us(20000U);
+						}
+
+						if (check_recv_timeout <= 0) {
+							fail_flag = true;
+							GMAC_PRINTF("timeout: phy-nearend-loopback fail at [x,y:m,n] = [%u,%u:%u,%u] @test_len=%u\n",
+								    tri, rri, trd, rrd, test_len[i]);
+						}
+
+						if (fail_flag)
+							break;
+
+						if (i == (sizeof(test_len) / sizeof(test_len[0]) - 1U)) {
+							uint8_t combo = (uint8_t)((tri << 7) | (rri << 6) |
+										  (trd << 3) | rrd);
+
+							GMAC_PRINTF("phy-nearend-loopback pass at [x,y:m,n] = [%u,%u:%u,%u]\n",
+								    tri, rri, trd, rrd);
+							if (pass_num < sizeof(pass_combo_para)) {
+								pass_combo_para[pass_num++] = combo;
+								GMAC_PRINTF("pass_num=%u, pass_combo=%u\n",
+									    pass_num, combo);
+							}
+						}
+					}
+					eqos_stop_and_deinit(&ctx);
+				}
+			}
+		}
+	}
+
+	if (pass_num) {
+		GMAC_PRINTF("pass num is %u\n", pass_num);
+		for (unsigned i = 0; i < pass_num; i++) {
+			int txinv = (pass_combo_para[i] >> 7) & 0x1;
+			int rxinv = (pass_combo_para[i] >> 6) & 0x1;
+			int txdelay = (pass_combo_para[i] >> 3) & 0x7;
+			int rxdelay = pass_combo_para[i] & 0x7;
+
+			GMAC_PRINTF(" [pass_combo:%u]: [(txinv,txdelay) (rxinv,rxdelay)]=[(%d:%d) (%d:%d)]\n",
+				    pass_combo_para[i], txinv, txdelay, rxinv, rxdelay);
+		}
+	} else {
+		GMAC_PRINTF(" --@@-@@-@@-@@-- RGMII tx/rx para fail all settings\n");
+	}
+	GMAC_PRINTF("======== rgmii_1000m tx/rx delay/reverse scan 结束 ========\n\n");
+}
+
+/*
+ * 对接外部 link partner（非 PHY near-end loopback / 非 MAC internal loopback）；速度与双工由自协商决定。
+ * TX：仅扫描 tx_clk_inv / emac_tx_clk_delay；对端用 Wireshark 看 RGMII 侧发包是否正常。
+ */
+void test_debug_determine_rgmii_tx_clk_delay_or_reverse_para_link_partner_check_on_wireshark(
+	uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+	const uint16_t test_len = 512U;
+	uint8_t *pkt;
+	const uint8_t rev_flags[2] = {0, 1};
+	const uint8_t delays[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+
+	GMAC_PRINTF("\n======== debug/determine rgmii tx clk_delay or reverse para (link partner) (check on Wireshark) 开始 ========\n");
+
+	s_dma = gmac_eqos_new_dma();
+	pkt = (uint8_t *)s_dma->tx_buf[0];
+	eqos_prepare_broadcast_test_packet(pkt, test_len);
+
+	for (unsigned ri = 0; ri < 2; ri++) {
+		for (unsigned dj = 0; dj < 8; dj++) {
+			GMAC_PRINTF("EQoS RGMII TX scan: tx_rev=%u tx_delay=%u\n",
+				    rev_flags[ri], delays[dj]);
+			gmac_phy_set_rgmii_timing(delays[dj], 5U, rev_flags[ri] != 0U, false);
+			if (eqos_setup_link_partner(&ctx, csr_base, csr_clock_hz, true)) {
+				eqos_stop_and_deinit(&ctx);
+				continue;
+			}
+			for (unsigned k = 0; k < 3U; k++) {
+				(void)gmac_mac_transmit(&ctx, pkt, test_len);
+				GMAC_PRINTF("TX scan burst=%u done, check Wireshark on link partner\n",
+					    k + 1U);
+				gmac_board_delay_us(100000U);
+			}
+			eqos_stop_and_deinit(&ctx);
+		}
+	}
+	GMAC_PRINTF("======== rgmii tx delay/reverse link partner scan 结束 ========\n\n");
+}
+
+/*
+ * 对接外部 link partner（非 near-end loopback）；RX 仅扫 rx_clk_inv / emac_rx_clk_delay。
+ * 对端 link up 后由主机脚本发送 GMAC_MY_NORMAL_PKT_TYPE 帧；3s 内累计 >10 判该组 RX OK。
+ */
+void test_debug_determine_rgmii_rx_clk_delay_or_reverse_para_link_partner_frames_from_host_script(
+	uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+	const uint8_t rev_flags[2] = {0, 1};
+	const uint8_t delays[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+
+	GMAC_PRINTF("\n======== debug/determine rgmii rx clk_delay or reverse para (link partner) (frames from host script) 开始 ========\n");
+	GMAC_PRINTF("请由 host 脚本持续发 GMAC_MY_NORMAL_PKT_TYPE 帧\n");
+
+	for (unsigned ri = 0; ri < 2; ri++) {
+		for (unsigned dj = 0; dj < 8; dj++) {
+			uint16_t expected_frame_cnt = 0;
+			int recv_poll = 3000; /* 3000 * 1ms = 3s */
+			bool rx_ok = false;
+
+			GMAC_PRINTF("EQoS RGMII RX scan: rx_rev=%u rx_delay=%u\n",
+				    rev_flags[ri], delays[dj]);
+			gmac_phy_set_rgmii_timing(5U, delays[dj], false, rev_flags[ri] != 0U);
+			if (eqos_setup_link_partner(&ctx, csr_base, csr_clock_hz, true)) {
+				eqos_stop_and_deinit(&ctx);
+				continue;
+			}
+			while (recv_poll-- > 0 && !rx_ok) {
+				while (gmac_get_receive_finish_int_flag(&ctx)) {
+					(void)gmac_receive_frame(&ctx, &expected_frame_cnt, false,
+								 false, false);
+					if (expected_frame_cnt > 10U) {
+						rx_ok = true;
+						break;
+					}
+				}
+				gmac_board_delay_us(1000U);
+			}
+			GMAC_PRINTF("EQoS RX scan result: count=%u %s\n", expected_frame_cnt,
+				    rx_ok ? "PASS" : "FAIL");
+			eqos_stop_and_deinit(&ctx);
+		}
+	}
+	GMAC_PRINTF("======== rgmii rx delay/reverse link partner scan 结束 ========\n\n");
+}
+
+/*
+ * TEST_CASE("transmit_infinitely test(link_partner)", "[P5 FPGA]")
+ * 对接 link partner 后持续发固定长度帧，便于压测链路稳定性/吞吐。
+ */
+void test_transmit_infinitely_link_partner(uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+	const uint16_t test_len = 1514U;
+	uint8_t *pkt;
+	unsigned cnt = 0;
+
+	GMAC_PRINTF("\n======== transmit_infinitely test(link_partner) 开始 ========\n");
+	s_dma = gmac_eqos_new_dma();
+	pkt = (uint8_t *)s_dma->tx_buf[0];
+	eqos_prepare_broadcast_test_packet(pkt, test_len);
+
+	if (eqos_setup_link_partner(&ctx, csr_base, csr_clock_hz, true))
+		return;
+
+	while (1) {
+		(void)gmac_mac_transmit(&ctx, pkt, test_len);
+		GMAC_PRINTF("TX infinite cnt=%u len=%u\n", ++cnt, test_len);
+		gmac_board_delay_us(1000000U);
+	}
+}
+
+/*
+ * TEST_CASE("transmit_diff_len test(link_partner)", "[P5 FPGA]")
+ * 对接 link partner 后按多包长发送，观察不同帧长在链路上的表现。
+ */
+void test_transmit_diff_len_link_partner(uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+	const uint16_t test_len_max = 1514U;
+	static const uint16_t test_len[] = {64, 128, 256, 512, 1024, 1514};
+	const unsigned send_times_every_len = 10U;
+	uint8_t *pkt;
+
+	GMAC_PRINTF("\n======== transmit_diff_len test(link_partner) 开始 ========\n");
+	s_dma = gmac_eqos_new_dma();
+	pkt = (uint8_t *)s_dma->tx_buf[0];
+	eqos_prepare_broadcast_test_packet(pkt, test_len_max);
+
+	if (eqos_setup_link_partner(&ctx, csr_base, csr_clock_hz, true))
+		return;
+
+	for (size_t i = 0; i < sizeof(test_len) / sizeof(test_len[0]); i++) {
+		for (unsigned j = 0; j < send_times_every_len; j++) {
+			(void)gmac_mac_transmit(&ctx, pkt, test_len[i]);
+			GMAC_PRINTF("tx diff len=%u %u/%u\n",
+				    test_len[i], j + 1U, send_times_every_len);
+			gmac_board_delay_us(20000U);
+		}
+	}
+
+	eqos_stop_and_deinit(&ctx);
+	GMAC_PRINTF("======== transmit_diff_len test(link_partner) 结束 ========\n\n");
+}
+
+/*
+ * TEST_CASE("receive test(link_partner)", "[P5 FPGA]")
+ * 对接 link partner 后持续接收并统计 GMAC_MY_NORMAL_PKT_TYPE 帧数量。
+ */
+void test_receive_link_partner(uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+	uint16_t expected_frame_cnt = 0;
+
+	GMAC_PRINTF("\n======== receive test(link_partner) 开始 ========\n");
+	GMAC_PRINTF("请由对端持续发 GMAC_MY_NORMAL_PKT_TYPE 帧\n");
+	if (eqos_setup_link_partner(&ctx, csr_base, csr_clock_hz, true))
+		return;
+
+	while (1) {
+		while (gmac_get_receive_finish_int_flag(&ctx)) {
+			(void)gmac_receive_frame(&ctx, &expected_frame_cnt, false, false, false);
+		}
+		GMAC_PRINTF("RX count=%u\n", expected_frame_cnt);
+		gmac_board_delay_us(1000000U);
+	}
+}
+
+/*
+ * 测试长时间发送接收，基于 PHY Near-end loopback
+ * here not linkpartner, need to configure phy forced link
+ * emac tx -> phyrx -> phytx -> emac rx
+ */
+void test_transmit_and_receive_longtime_force_link_phy(uintptr_t csr_base, unsigned csr_clock_hz)
+{
+	static gmac_hal_context_t ctx;
+	const uint16_t test_len = 512U;
+	uint8_t *pkt;
+	gmac_speed_t speed;
+
+#if (GMAC_PHY_INTF == EQOS_PHY_INTF_RGMII)
+	speed = GMAC_SPEED_1000M;
+#else
+	speed = GMAC_SPEED_100M;
+#endif
+
+	GMAC_PRINTF("\n======== transmit and receive longtime test(force_link_phy) 开始 ========\n");
+	s_dma = gmac_eqos_new_dma();
+	pkt = (uint8_t *)s_dma->tx_buf[0];
+	eqos_prepare_broadcast_test_packet(pkt, test_len);
+
+	if (eqos_setup_force_link_phy_near_loopback(&ctx, csr_base, csr_clock_hz, speed))
+		return;
+
+	while (1) {
+		int timeout = 200;
+
+		(void)gmac_mac_transmit(&ctx, pkt, test_len);
+		while (timeout--) {
+			if (gmac_get_receive_finish_int_flag(&ctx) &&
+			    gmac_receive_frame(&ctx, NULL, true, true, false)) {
+				GMAC_PRINTF("longtime pass len=%u\n", test_len);
+				break;
+			}
+			gmac_board_delay_us(20000U);
+		}
+		if (timeout <= 0)
+			GMAC_PRINTF("longtime receive timeout\n");
+	}
 }

@@ -102,7 +102,7 @@ if (of_device_compatible_match(np, stmmac_gmac4_compats)) {
 
 | API | 作用 |
 |-----|------|
-| `gmac_eqos_test_bind(csr_base, csr_clock_hz)` | 设置 CSR 物理基址与 CSR 时钟（Hz）；`csr_clock_hz` 可为 0 则跳过 1us 计数器配置 |
+| `gmac_eqos_test_bind(csr_base, csr_clock_hz)` | 设置 CSR 物理基址与 CSR 时钟（Hz）；底层绑定函数，普通测试入口已内置调用 |
 | `gmac_mac_init(hal)` | DMA 软复位、总线模式、单通道 TX/RX 描述符环、MTL SF、RX 队列路由、MAC 基础位、MAC 地址 0、PHYIF `LUD` 等 |
 | `gmac_mac_near_loopback_prepare(hal)` | 报文过滤（PR+RA）+ `GMAC_CONFIG_LM` |
 | `gmac_mac_set_speed` / `gmac_mac_set_duplex` | `GMAC_CONFIG` 的 PS/FES/DM |
@@ -111,7 +111,8 @@ if (of_device_compatible_match(np, stmmac_gmac4_compats)) {
 | `gmac_get_receive_finish_int_flag` | 读/清 `DMA_CHAN_STATUS` 的 RI 等（可与轮询描述符配合） |
 | `gmac_receive_frame` | 扫描 RX 环，取最后一节描述符长度（减 CRC），可选整帧载荷与 golden 比对 |
 | `gmac_mac_del` | 停 DMA/MAC 并清环回 |
-| `test_mac_near_end_loopback_force_link(speed)` | 与参考 `test_gmac.c` 相同的多档长度与 EtherType **`0x88B5`**、载荷 **`i & 0xff`** 比对 |
+| `test_gmac_env_basic(csr_base, csr_clock_hz)` | 类似 P5 `GMAC env basic test`：读取 version / feature，并做 VLAN_TAG 可恢复读写测试 |
+| `test_mac_near_end_loopback_force_link(csr_base, csr_clock_hz, speed)` | 与参考 `test_gmac.c` 相同的多档长度与 EtherType **`0x88B5`**、载荷 **`i & 0xff`** 比对；入口内置 `gmac_eqos_test_bind` |
 
 PHY 占位（与参考工程同名，便于替换）：`gmac_glb_cfg_init`、`gmac_phy_vcs8541_init`、`gmac_phy_802_3_basic_phy_deinit` 在本参考中为空实现，可按 SoC 接真实 PHY 驱动。
 
@@ -141,8 +142,11 @@ make          # 生成 libgmac_eqos.a
 
 void board_gmac_test(void)
 {
-    gmac_eqos_test_bind(0xYOUR_CSR_BASE_PHYS, 125000000u); /* 示例：125MHz CSR */
-    test_mac_near_end_loopback_force_link(GMAC_SPEED_1000M);
+    uintptr_t csr_base = 0xYOUR_CSR_BASE_PHYS;
+    unsigned csr_hz = 125000000u; /* 示例：125MHz CSR */
+
+    test_gmac_env_basic(csr_base, csr_hz);
+    test_mac_near_end_loopback_force_link(csr_base, csr_hz, GMAC_SPEED_1000M);
 }
 ```
 

@@ -29,23 +29,32 @@ void gmac_dma_cache_invalidate(void *addr, size_t size);
 	gmac_dma_cache_invalidate((void *)(uintptr_t)(addr), (size_t)(size))
 #endif
 
+#ifndef GMAC_EQOS_SPEED_T_DEFINED
+#define GMAC_EQOS_SPEED_T_DEFINED
 typedef enum {
 	GMAC_SPEED_10M = 0,
 	GMAC_SPEED_100M,
 	GMAC_SPEED_1000M,
 } gmac_speed_t;
+#endif
 
+#ifndef GMAC_EQOS_DUPLEX_T_DEFINED
+#define GMAC_EQOS_DUPLEX_T_DEFINED
 typedef enum {
 	GMAC_DUPLEX_HALF = 0,
 	GMAC_DUPLEX_FULL,
 } gmac_duplex_t;
+#endif
 
+#ifndef GMAC_EQOS_HAL_CONTEXT_T_DEFINED
+#define GMAC_EQOS_HAL_CONTEXT_T_DEFINED
 typedef struct gmac_hal_context {
 	uintptr_t csr_base; /* EQoS CSR 统一基址（含 MAC/MTL/DMA） */
 	uint8_t mac_addr[6];
 	/* 内部状态，勿直接修改 */
 	uint32_t _priv[64];
 } gmac_hal_context_t;
+#endif
 
 #include "gmac_eqos_phy.h"
 
@@ -74,6 +83,7 @@ extern void gmac_io_write32(uintptr_t addr, uint32_t v);
 
 /* 可选：CSR 时钟 Hz，用于 1us tick；未知时可传 0 则跳过写 1US 计数器 */
 void gmac_eqos_set_csr_clock_hz(unsigned hz);
+unsigned gmac_eqos_get_csr_clock_hz(void);
 
 void gmac_mac_init(gmac_hal_context_t *hal);
 void gmac_mac_near_loopback_prepare(gmac_hal_context_t *hal);
@@ -91,6 +101,24 @@ bool gmac_receive_frame(gmac_hal_context_t *hal, uint16_t *expected_frame,
 
 /* 参考 test_gmac.c 的入口：调用前必须先绑定 CSR 基址（与 AXI 从端口一致） */
 void gmac_eqos_test_bind(uintptr_t csr_base, unsigned csr_clock_hz);
-void test_mac_near_end_loopback_force_link(gmac_speed_t force_link_speed);
+void test_gmac_env_basic(uintptr_t csr_base, unsigned csr_clock_hz);
+void test_get_phy_addr(uintptr_t csr_base, unsigned csr_clock_hz);
+void test_smi_phy_reg_read_write(uintptr_t csr_base, unsigned csr_clock_hz);
+void test_phy_auto_negotiation_link_partner(uintptr_t csr_base, unsigned csr_clock_hz);
+void test_mac_near_end_loopback_force_link(uintptr_t csr_base, unsigned csr_clock_hz,
+					   gmac_speed_t force_link_speed);
+void test_phy_near_end_loopback_force_link(uintptr_t csr_base, unsigned csr_clock_hz,
+					   gmac_speed_t force_link_speed);
+void test_gmac_interrupt_receive_pkt_force_link_mac(uintptr_t csr_base, unsigned csr_clock_hz);
+void test_debug_determine_rgmii_1000m_tx_rx_clk_delay_or_reverse_para_base_on_phy_near_end_loopback_force_link(
+	uintptr_t csr_base, unsigned csr_clock_hz);
+void test_debug_determine_rgmii_tx_clk_delay_or_reverse_para_link_partner_check_on_wireshark(
+	uintptr_t csr_base, unsigned csr_clock_hz);
+void test_debug_determine_rgmii_rx_clk_delay_or_reverse_para_link_partner_frames_from_host_script(
+	uintptr_t csr_base, unsigned csr_clock_hz);
+void test_transmit_infinitely_link_partner(uintptr_t csr_base, unsigned csr_clock_hz);
+void test_transmit_diff_len_link_partner(uintptr_t csr_base, unsigned csr_clock_hz);
+void test_receive_link_partner(uintptr_t csr_base, unsigned csr_clock_hz);
+void test_transmit_and_receive_longtime_force_link_phy(uintptr_t csr_base, unsigned csr_clock_hz);
 
 #endif /* GMAC_EQOS_HAL_H */

@@ -29,3 +29,26 @@ __attribute__((weak)) void gmac_dma_cache_invalidate(void *addr, size_t size)
 	(void)addr;
 	(void)size;
 }
+
+__attribute__((weak)) void intr_handler_set(int source, void (*isr_handle)(void *), void *param)
+{
+	(void)source;
+	(void)isr_handle;
+	(void)param;
+}
+
+__attribute__((weak)) void esprv_intc_int_set_priority(int source, int priority)
+{
+	(void)source;
+	(void)priority;
+}
+
+__attribute__((weak)) void esprv_intc_int_enable(int source)
+{
+	(void)source;
+}
+
+__attribute__((weak)) void esprv_intc_int_disable(int source)
+{
+	(void)source;
+}

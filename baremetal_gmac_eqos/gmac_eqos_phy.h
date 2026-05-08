@@ -15,6 +15,27 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef GMAC_EQOS_SPEED_T_DEFINED
+#define GMAC_EQOS_SPEED_T_DEFINED
+typedef enum {
+	GMAC_SPEED_10M = 0,
+	GMAC_SPEED_100M,
+	GMAC_SPEED_1000M,
+} gmac_speed_t;
+#endif
+
+#ifndef GMAC_EQOS_DUPLEX_T_DEFINED
+#define GMAC_EQOS_DUPLEX_T_DEFINED
+typedef enum {
+	GMAC_DUPLEX_HALF = 0,
+	GMAC_DUPLEX_FULL,
+} gmac_duplex_t;
+#endif
+
+#ifndef GMAC_EQOS_HAL_CONTEXT_T_DEFINED
+typedef struct gmac_hal_context gmac_hal_context_t;
+#endif
+
 #ifndef GMAC_PHY_ADDR_AUTO
 #define GMAC_PHY_ADDR_AUTO	(-1)
 #endif
@@ -77,6 +98,12 @@ typedef struct {
 	bool is_phy_near_end_loopback;	/* true：BMCR loopback；false：EPC 远端环回位 */
 } phy_extra_config_t;
 
+typedef struct {
+	int link_st;
+	gmac_speed_t speed;
+	gmac_duplex_t duplex;
+} gmac_port_link_t;
+
 extern phy_config_t g_eqos_phy_config;
 
 void gmac_board_delay_us(unsigned us);
@@ -85,8 +112,15 @@ void gmac_board_phy_gpio_reset(int gpio_num, int assert_level_us, int release);
 
 int gmac_phy_reset_hw(phy_config_t *phy);
 void gmac_glb_cfg_init(gmac_hal_context_t *hal);
+int gmac_phy_detect_phy_addr(gmac_hal_context_t *hal, int *detected_addr);
+void gmac_phy_set_rgmii_timing(uint32_t tx_delay, uint32_t rx_delay,
+			       bool tx_clk_reverse, bool rx_clk_reverse);
 void gmac_phy_vcs8541_init(phy_config_t *phy_cfg, gmac_hal_context_t *hal,
 			    phy_extra_config_t *phy_extra);
+int gmac_phy_vcs8541_reg_read_write(phy_config_t *phy_cfg, gmac_hal_context_t *hal);
+int gmac_phy_vcs8541_auto_nego_restart(phy_config_t *phy_cfg, gmac_hal_context_t *hal);
+int gmac_phy_vcs8541_get_link_info(phy_config_t *phy_cfg, gmac_hal_context_t *hal,
+				   gmac_port_link_t *link_status);
 void gmac_phy_802_3_basic_phy_deinit(phy_config_t *phy_cfg, gmac_hal_context_t *hal);
 
 /* MDIO 调试接口（可选） */

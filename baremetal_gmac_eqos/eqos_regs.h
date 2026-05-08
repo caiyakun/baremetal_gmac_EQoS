@@ -20,6 +20,8 @@
 #define GMAC_EXT_CONFIG			0x0004U
 /* MAC Packet Filter：包过滤配置，控制混杂模式、广播/组播、Receive-All 等过滤行为。 */
 #define GMAC_PACKET_FILTER		0x0008U
+/* MAC VLAN Tag：VLAN tag/filter 基础寄存器；env basic test 中用作可恢复读写测试。 */
+#define GMAC_VLAN_TAG			0x0050U
 /* MAC RX Flow Control：RX 流控/PAUSE 相关配置，当前 near-end loopback 未使用。 */
 #define GMAC_RX_FLOW_CTRL		0x0090U
 /* MAC RX Queue Control 0：每个 RX queue 的使能模式，queue0 常用 DCB/AV 模式。 */
